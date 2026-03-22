@@ -355,6 +355,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
   private _isDestroyed: boolean = false
   private _destroyPending: boolean = false
   private _destroyFinalized: boolean = false
+  private _destroyCleanupPrepared: boolean = false
   public nextRenderBuffer: OptimizedBuffer
   public currentRenderBuffer: OptimizedBuffer
   private _isRunning: boolean = false
@@ -1937,17 +1938,17 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     this._destroyPending = true
 
     if (this.rendering) {
-      // Defer teardown until the active frame completes to avoid freeing native resources mid-render.
+      // Restore terminal/input state immediately, but defer full native teardown until the frame unwinds.
+      this.prepareDestroyDuringRender()
       return
     }
 
     this.finalizeDestroy()
   }
 
-  private finalizeDestroy(): void {
-    if (this._destroyFinalized) return
-    this._destroyFinalized = true
-    this._destroyPending = false
+  private cleanupBeforeDestroy(): void {
+    if (this._destroyCleanupPrepared) return
+    this._destroyCleanupPrepared = true
 
     process.removeListener("SIGWINCH", this.sigwinchHandler)
     process.removeListener("uncaughtException", this.handleError)
@@ -1969,24 +1970,15 @@ export class CliRenderer extends EventEmitter implements RenderContext {
 
     if (this.memorySnapshotTimer) {
       this.clock.clearInterval(this.memorySnapshotTimer)
+      this.memorySnapshotTimer = null
     }
-
-    // Clean up palette detector
-    if (this._paletteDetector) {
-      this._paletteDetector.cleanup()
-      this._paletteDetector = null
-    }
-    this._paletteDetectionPromise = null
-    this._cachedPalette = null
-
-    this.emit(CliRenderEvents.DESTROY)
 
     if (this.renderTimeout) {
       this.clock.clearTimeout(this.renderTimeout)
       this.renderTimeout = null
     }
-    this._isRunning = false
 
+    this._isRunning = false
     this.waitingForPixelResolution = false
     this.updateStdinParserProtocolContext(
       {
@@ -1998,27 +1990,51 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     )
     this.setCapturedRenderable(undefined)
 
+    this.stdin.removeListener("data", this.stdinListener)
+    if (this.stdin.setRawMode) {
+      this.stdin.setRawMode(false)
+    }
+
+    this.disableStdoutInterception()
+
+    if (this._splitHeight > 0) {
+      this.flushStdoutCache(this._splitHeight, true)
+    }
+  }
+
+  private prepareDestroyDuringRender(): void {
+    this.cleanupBeforeDestroy()
+    this.lib.suspendRenderer(this.rendererPtr)
+  }
+
+  private finalizeDestroy(): void {
+    if (this._destroyFinalized) return
+
+    this._destroyFinalized = true
+    this._destroyPending = false
+
+    this.cleanupBeforeDestroy()
+
+    // Clean up palette detector
+    if (this._paletteDetector) {
+      this._paletteDetector.cleanup()
+      this._paletteDetector = null
+    }
+    this._paletteDetectionPromise = null
+    this._cachedPalette = null
+
+    this.emit(CliRenderEvents.DESTROY)
+
     try {
       this.root.destroyRecursively()
     } catch (e) {
       console.error("Error destroying root renderable:", e instanceof Error ? e.stack : String(e))
     }
 
-    // Remove listener before destroying parser
-    this.stdin.removeListener("data", this.stdinListener)
-    if (this.stdin.setRawMode) {
-      this.stdin.setRawMode(false)
-    }
-
     this.stdinParser?.destroy()
     this.stdinParser = null
     this.oscSubscribers.clear()
     this._console.destroy()
-    this.disableStdoutInterception()
-
-    if (this._splitHeight > 0) {
-      this.flushStdoutCache(this._splitHeight, true)
-    }
 
     this.lib.destroyRenderer(this.rendererPtr)
     rendererTracker.removeRenderer(this)
