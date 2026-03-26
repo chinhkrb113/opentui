@@ -1,5 +1,6 @@
 import { ANSI } from "./ansi.js"
 import { Renderable, RootRenderable } from "./Renderable.js"
+import { TextRenderable } from "./renderables/Text.js"
 import {
   DebugOverlayCorner,
   type CursorStyleOptions,
@@ -214,6 +215,9 @@ export interface ScrollbackSnapshot {
   root: Renderable
   width?: number
   height?: number
+  rowColumns?: number
+  startOnNewLine?: boolean
+  trailingNewline?: boolean
 }
 
 export interface ScrollbackComponent<Data> {
@@ -269,15 +273,12 @@ function resolveModes(config: CliRendererConfig): {
   }
 }
 
-type ExternalOutputCommit =
-  | {
-      kind: "text"
-      text: string
-    }
-  | {
-      kind: "snapshot"
-      snapshot: OptimizedBuffer
-    }
+type ExternalOutputCommit = {
+  snapshot: OptimizedBuffer
+  rowColumns: number
+  startOnNewLine: boolean
+  trailingNewline: boolean
+}
 
 class ExternalOutputQueue {
   private commits: ExternalOutputCommit[] = []
@@ -286,13 +287,8 @@ class ExternalOutputQueue {
     return this.commits.length
   }
 
-  writeText(text: string): void {
-    if (text.length === 0) return
-    this.commits.push({ kind: "text", text })
-  }
-
-  writeSnapshot(snapshot: OptimizedBuffer): void {
-    this.commits.push({ kind: "snapshot", snapshot })
+  writeSnapshot(commit: ExternalOutputCommit): void {
+    this.commits.push(commit)
   }
 
   claim(): ExternalOutputCommit[] {
@@ -307,9 +303,7 @@ class ExternalOutputQueue {
 
   clear(): void {
     for (const commit of this.commits) {
-      if (commit.kind === "snapshot") {
-        commit.snapshot.destroy()
-      }
+      commit.snapshot.destroy()
     }
     this.commits = []
   }
@@ -708,8 +702,6 @@ export class CliRenderer extends EventEmitter implements RenderContext {
   private _terminalIsSetup: boolean = false
 
   private externalOutputQueue = new ExternalOutputQueue()
-  private externalOutputEncoder = new TextEncoder()
-  private readonly emptyExternalOutputBytes = new Uint8Array(0)
   private realStdoutWrite: (chunk: any, encoding?: any, callback?: any) => boolean
 
   private _useConsole: boolean = true
@@ -758,12 +750,8 @@ export class CliRenderer extends EventEmitter implements RenderContext {
 
     let capturedExternalOutput = ""
     for (const commit of capturedExternalOutputCommits) {
-      if (commit.kind === "text") {
-        capturedExternalOutput += commit.text
-      } else {
-        capturedExternalOutput += `[snapshot ${commit.snapshot.width}x${commit.snapshot.height}]\n`
-        commit.snapshot.destroy()
-      }
+      capturedExternalOutput += `[snapshot ${commit.snapshot.width}x${commit.snapshot.height}]\n`
+      commit.snapshot.destroy()
     }
 
     if (capturedConsoleOutput.length > 0 || capturedExternalOutput.length > 0 || cachedLogs.length > 0) {
@@ -1291,8 +1279,8 @@ export class CliRenderer extends EventEmitter implements RenderContext {
       throw new Error('writeToScrollback requires screenMode "split-footer" and externalOutputMode "capture-stdout"')
     }
 
-    const snapshot = this.createScrollbackSnapshot(component, data)
-    this.enqueueExternalSnapshot(snapshot)
+    const commit = this.createScrollbackSnapshotCommit(component, data)
+    this.enqueueExternalSnapshotCommit(commit)
   }
 
   private getSnapshotDimension(value: number | undefined, fallback: number, axis: "width" | "height"): number {
@@ -1306,7 +1294,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     return Math.min(Math.max(Math.trunc(rawValue), 1), maxDimension)
   }
 
-  private createScrollbackSnapshot<Data>(component: ScrollbackComponent<Data>, data: Data): OptimizedBuffer {
+  private createScrollbackSnapshotCommit<Data>(component: ScrollbackComponent<Data>, data: Data): ExternalOutputCommit {
     const snapshotContext = new ScrollbackSnapshotRenderContext(this.width, this.height, this.widthMethod)
     const snapshot = component.scrollback(data, {
       width: this.width,
@@ -1321,6 +1309,12 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     const rootRenderable = snapshot.root
     const snapshotWidth = this.getSnapshotDimension(snapshot.width, rootRenderable.width, "width")
     const snapshotHeight = this.getSnapshotDimension(snapshot.height, rootRenderable.height, "height")
+    const snapshotRowColumns = Math.min(
+      Math.max(Math.trunc(snapshot.rowColumns ?? snapshotWidth), 0),
+      snapshotWidth,
+    )
+    const startOnNewLine = snapshot.startOnNewLine ?? true
+    const trailingNewline = snapshot.trailingNewline ?? true
     const snapshotRoot = new RootRenderable(snapshotContext)
     const snapshotBuffer = OptimizedBuffer.create(snapshotWidth, snapshotHeight, this.widthMethod, {
       id: "scrollback-snapshot-commit",
@@ -1329,7 +1323,12 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     try {
       snapshotRoot.add(rootRenderable)
       snapshotRoot.render(snapshotBuffer, 0)
-      return snapshotBuffer
+      return {
+        snapshot: snapshotBuffer,
+        rowColumns: snapshotRowColumns,
+        startOnNewLine,
+        trailingNewline,
+      }
     } catch (error) {
       snapshotBuffer.destroy()
       throw error
@@ -1338,17 +1337,96 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     }
   }
 
-  private enqueueExternalText(text: string): void {
-    if (text.length === 0) {
-      return
-    }
+  private createStdoutSnapshotCommit(line: string, trailingNewline: boolean): ExternalOutputCommit {
+    const snapshotContext = new ScrollbackSnapshotRenderContext(this.width, 1, this.widthMethod)
+    const maxWidth = Math.max(1, this.width)
+    const lineCells = [...line]
+    const rowColumns = Math.min(lineCells.length, maxWidth)
+    const renderedLine = lineCells.slice(0, maxWidth).join("")
+    const snapshotRoot = new RootRenderable(snapshotContext)
+    const snapshotRenderable = new TextRenderable(snapshotContext, {
+      id: "captured-stdout-snapshot",
+      position: "absolute",
+      left: 0,
+      top: 0,
+      width: Math.max(1, rowColumns),
+      height: 1,
+      content: renderedLine,
+    })
+    const snapshotBuffer = OptimizedBuffer.create(Math.max(1, rowColumns), 1, this.widthMethod, {
+      id: "captured-stdout-snapshot",
+    })
 
-    this.externalOutputQueue.writeText(text)
-    this.requestRender()
+    try {
+      snapshotRoot.add(snapshotRenderable)
+      snapshotRoot.render(snapshotBuffer, 0)
+      return {
+        snapshot: snapshotBuffer,
+        rowColumns,
+        startOnNewLine: false,
+        trailingNewline,
+      }
+    } catch (error) {
+      snapshotBuffer.destroy()
+      throw error
+    } finally {
+      snapshotRoot.destroyRecursively()
+    }
   }
 
-  private enqueueExternalSnapshot(snapshot: OptimizedBuffer): void {
-    this.externalOutputQueue.writeSnapshot(snapshot)
+  private splitStdoutRows(text: string): Array<{ line: string; trailingNewline: boolean }> {
+    const rows: Array<{ line: string; trailingNewline: boolean }> = []
+    let current = ""
+
+    for (const char of text) {
+      if (char === "\r") {
+        current = ""
+        continue
+      }
+
+      if (char === "\n") {
+        rows.push({ line: current, trailingNewline: true })
+        current = ""
+        continue
+      }
+
+      current += char
+    }
+
+    if (current.length > 0) {
+      rows.push({ line: current, trailingNewline: false })
+    }
+
+    return rows
+  }
+
+  private createStdoutSnapshotCommits(text: string): ExternalOutputCommit[] {
+    if (text.length === 0) {
+      return []
+    }
+
+    const commits: ExternalOutputCommit[] = []
+    for (const row of this.splitStdoutRows(text)) {
+      const rowCells = [...row.line]
+      if (rowCells.length === 0) {
+        commits.push(this.createStdoutSnapshotCommit("", row.trailingNewline))
+        continue
+      }
+
+      let offset = 0
+      while (offset < rowCells.length) {
+        const chunk = rowCells.slice(offset, offset + this.width).join("")
+        offset += this.width
+        const isLastChunk = offset >= rowCells.length
+        commits.push(this.createStdoutSnapshotCommit(chunk, isLastChunk ? row.trailingNewline : false))
+      }
+    }
+
+    return commits
+  }
+
+  private enqueueExternalSnapshotCommit(commit: ExternalOutputCommit): void {
+    this.externalOutputQueue.writeSnapshot(commit)
     this.requestRender()
   }
 
@@ -1357,26 +1435,13 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     let hasCommittedOutput = false
 
     for (const commit of commits) {
-      if (commit.kind === "text") {
-        const outputBytes = this.externalOutputEncoder.encode(commit.text)
-        if (outputBytes.length === 0) {
-          continue
-        }
-
-        this.renderOffset = this.lib.renderSplitFooter(
-          this.rendererPtr,
-          outputBytes,
-          this.getSplitPinnedRenderOffset(),
-          true,
-        )
-        hasCommittedOutput = true
-        continue
-      }
-
       try {
         this.renderOffset = this.lib.renderSplitFooterSnapshot(
           this.rendererPtr,
           commit.snapshot,
+          commit.rowColumns,
+          commit.startOnNewLine,
+          commit.trailingNewline,
           this.getSplitPinnedRenderOffset(),
           true,
         )
@@ -1387,9 +1452,8 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     }
 
     if (!hasCommittedOutput) {
-      this.renderOffset = this.lib.renderSplitFooter(
+      this.renderOffset = this.lib.repaintSplitFooter(
         this.rendererPtr,
-        this.emptyExternalOutputBytes,
         this.getSplitPinnedRenderOffset(),
         forceFooterRepaint,
       )
@@ -1406,7 +1470,14 @@ export class CliRenderer extends EventEmitter implements RenderContext {
       this._screenMode === "split-footer" &&
       this._splitHeight > 0
     ) {
-      this.enqueueExternalText(text)
+      const commits = this.createStdoutSnapshotCommits(text)
+      for (const commit of commits) {
+        this.externalOutputQueue.writeSnapshot(commit)
+      }
+
+      if (commits.length > 0) {
+        this.requestRender()
+      }
     }
 
     if (typeof resolvedCallback === "function") {
@@ -1556,12 +1627,8 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     const outputCommits = this.externalOutputQueue.claim()
     let output = ""
     for (const commit of outputCommits) {
-      if (commit.kind === "text") {
-        output += commit.text
-      } else {
-        output += `[snapshot ${commit.snapshot.width}x${commit.snapshot.height}]\n`
-        commit.snapshot.destroy()
-      }
+      output += `[snapshot ${commit.snapshot.width}x${commit.snapshot.height}]\n`
+      commit.snapshot.destroy()
     }
 
     const rendererStartLine = this.renderOffset + 1
