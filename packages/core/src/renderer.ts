@@ -37,7 +37,11 @@ import {
   parsePixelResolution,
 } from "./lib/terminal-capability-detection.js"
 import { type Clock, type TimerHandle, SystemClock } from "./lib/clock.js"
-import { StdinParser, type StdinEvent, type StdinParserProtocolContext } from "./lib/stdin-parser.js"
+import {
+  StdinParser,
+  type StdinEvent,
+  type StdinParserProtocolContext,
+} from "./lib/stdin-parser.js"
 
 registerEnvVar({
   name: "OTUI_DUMP_CAPTURES",
@@ -676,6 +680,8 @@ export class CliRenderer extends EventEmitter implements RenderContext {
 
   private resizeTimeoutId: TimerHandle | null = null
   private capabilityTimeoutId: TimerHandle | null = null
+  private splitStartupSeedTimeoutId: TimerHandle | null = null
+  private pendingSplitStartupCursorSeed: boolean = false
   private resizeDebounceDelay: number = 100
 
   private enableMouseMovement: boolean = false
@@ -913,6 +919,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
         privateCapabilityRepliesActive: false,
         pixelResolutionQueryActive: false,
         explicitWidthCprActive: false,
+        startupCursorCprActive: false,
       },
       clock: this.clock,
     })
@@ -1238,7 +1245,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     this.stdout.write = mode === "capture-stdout" ? this.interceptStdoutWrite : this.realStdoutWrite
 
     if (this._screenMode === "split-footer" && this._splitHeight > 0 && mode === "capture-stdout") {
-      this.resetSplitScrollback(previousMode === "passthrough" ? this.getSplitPinnedRenderOffset() : 0)
+      this.resetSplitScrollback(this.getSplitCursorSeedRows())
       return
     }
 
@@ -1492,6 +1499,12 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     return this._screenMode === "split-footer" ? Math.max(this._terminalHeight - this._splitHeight, 0) : 0
   }
 
+  private getSplitCursorSeedRows(): number {
+    const cursorState = this.lib.getCursorState(this.rendererPtr)
+    const cursorRow = Number.isFinite(cursorState.y) ? Math.max(Math.trunc(cursorState.y), 1) : 1
+    return Math.min(cursorRow, Math.max(this._terminalHeight, 1))
+  }
+
   private flushPendingSplitOutputBeforeTransition(forceFooterRepaint: boolean = false): void {
     if (
       this._screenMode !== "split-footer" ||
@@ -1589,7 +1602,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
 
     if (this._screenMode === "split-footer" && this._externalOutputMode === "capture-stdout") {
       if (prevScreenMode !== "split-footer") {
-        this.resetSplitScrollback(0)
+        this.resetSplitScrollback(this.getSplitCursorSeedRows())
       } else {
         this.syncSplitScrollback()
       }
@@ -1691,9 +1704,11 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     if (this._terminalIsSetup) return
     this._terminalIsSetup = true
 
+    const startupCursorCprActive = this._screenMode === "split-footer" && this._externalOutputMode === "capture-stdout"
     this.updateStdinParserProtocolContext({
       privateCapabilityRepliesActive: true,
       explicitWidthCprActive: true,
+      startupCursorCprActive,
     })
     this.lib.setupTerminal(this.rendererPtr, this._screenMode === "alternate-screen")
     this._capabilities = this.lib.getTerminalCapabilities(this.rendererPtr)
@@ -1709,11 +1724,23 @@ export class CliRenderer extends EventEmitter implements RenderContext {
 
     this.capabilityTimeoutId = this.clock.setTimeout(() => {
       this.capabilityTimeoutId = null
+      this.pendingSplitStartupCursorSeed = false
+
+      if (this.splitStartupSeedTimeoutId !== null) {
+        this.clock.clearTimeout(this.splitStartupSeedTimeoutId)
+        this.splitStartupSeedTimeoutId = null
+      }
+
+      if (this._screenMode === "split-footer" && this._externalOutputMode === "capture-stdout") {
+        this.requestRender()
+      }
+
       this.removeInputHandler(this.capabilityHandler)
       this.updateStdinParserProtocolContext(
         {
           privateCapabilityRepliesActive: false,
           explicitWidthCprActive: false,
+          startupCursorCprActive: false,
         },
         true,
       )
@@ -1721,6 +1748,28 @@ export class CliRenderer extends EventEmitter implements RenderContext {
 
     if (this._useMouse) {
       this.enableMouse()
+    }
+
+    if (this._screenMode === "split-footer" && this._externalOutputMode === "capture-stdout") {
+      this.pendingSplitStartupCursorSeed = true
+
+      if (this.splitStartupSeedTimeoutId !== null) {
+        this.clock.clearTimeout(this.splitStartupSeedTimeoutId)
+      }
+
+      this.splitStartupSeedTimeoutId = this.clock.setTimeout(() => {
+        this.splitStartupSeedTimeoutId = null
+
+        if (!this.pendingSplitStartupCursorSeed) {
+          return
+        }
+
+        this.updateStdinParserProtocolContext({ startupCursorCprActive: false })
+
+        if (this._screenMode === "split-footer" && this._externalOutputMode === "capture-stdout") {
+          this.requestRender()
+        }
+      }, 120)
     }
 
     this.queryPixelResolution()
@@ -1763,14 +1812,47 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     }
   }
 
-  private capabilityHandler: (sequence: string) => boolean = ((sequence: string) => {
-    if (isCapabilityResponse(sequence)) {
-      this.lib.processCapabilityResponse(this.rendererPtr, sequence)
-      this._capabilities = this.lib.getTerminalCapabilities(this.rendererPtr)
-      this.emit(CliRenderEvents.CAPABILITIES, this._capabilities)
-      return true
+  private processCapabilitySequence(sequence: string, hasCursorReport: boolean): boolean {
+    const hasStandardCapabilitySignature = isCapabilityResponse(sequence)
+    const shouldProcessAsCapability =
+      hasStandardCapabilitySignature || (hasCursorReport && this.capabilityTimeoutId !== null)
+
+    if (!shouldProcessAsCapability) {
+      return false
     }
-    return false
+
+    this.lib.processCapabilityResponse(this.rendererPtr, sequence)
+    this._capabilities = this.lib.getTerminalCapabilities(this.rendererPtr)
+    this.emit(CliRenderEvents.CAPABILITIES, this._capabilities)
+
+    const hadPendingSplitStartupCursorSeed = this.pendingSplitStartupCursorSeed
+
+    if (
+      hadPendingSplitStartupCursorSeed &&
+      hasCursorReport &&
+      this._screenMode === "split-footer" &&
+      this._externalOutputMode === "capture-stdout"
+    ) {
+      this.resetSplitScrollback(this.getSplitCursorSeedRows())
+      this.pendingSplitStartupCursorSeed = false
+      this.updateStdinParserProtocolContext({ startupCursorCprActive: false })
+
+      if (this.splitStartupSeedTimeoutId !== null) {
+        this.clock.clearTimeout(this.splitStartupSeedTimeoutId)
+        this.splitStartupSeedTimeoutId = null
+      }
+
+      this.requestRender()
+    }
+
+    const consumeStartupCursorReport =
+      hadPendingSplitStartupCursorSeed && hasCursorReport && this.splitStartupSeedTimeoutId !== null
+
+    return hasStandardCapabilitySignature || consumeStartupCursorReport
+  }
+
+  private capabilityHandler: (sequence: string) => boolean = ((sequence: string) => {
+    return this.processCapabilitySequence(sequence, false)
   }).bind(this)
 
   private focusHandler: (sequence: string) => boolean = ((sequence: string) => {
@@ -1867,6 +1949,10 @@ export class CliRenderer extends EventEmitter implements RenderContext {
           for (const subscriber of this.oscSubscribers) {
             subscriber(event.sequence)
           }
+        }
+
+        if (event.protocol === "cpr" && this.processCapabilitySequence(event.sequence, true)) {
+          return
         }
 
         this.dispatchSequenceHandlers(event.sequence)
@@ -2474,6 +2560,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
       privateCapabilityRepliesActive: false,
       pixelResolutionQueryActive: false,
       explicitWidthCprActive: false,
+      startupCursorCprActive: false,
     })
     this.stdinParser?.reset()
     this.stdin.removeListener("data", this.stdinListener)
@@ -2598,6 +2685,11 @@ export class CliRenderer extends EventEmitter implements RenderContext {
       this.capabilityTimeoutId = null
     }
 
+    if (this.splitStartupSeedTimeoutId !== null) {
+      this.clock.clearTimeout(this.splitStartupSeedTimeoutId)
+      this.splitStartupSeedTimeoutId = null
+    }
+
     if (this.memorySnapshotTimer) {
       this.clock.clearInterval(this.memorySnapshotTimer)
     }
@@ -2624,6 +2716,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
         privateCapabilityRepliesActive: false,
         pixelResolutionQueryActive: false,
         explicitWidthCprActive: false,
+        startupCursorCprActive: false,
       },
       true,
     )
@@ -2799,6 +2892,17 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     }
 
     this.renderingNative = true
+
+    if (
+      this.pendingSplitStartupCursorSeed &&
+      this.splitStartupSeedTimeoutId !== null &&
+      this._splitHeight > 0 &&
+      this._externalOutputMode === "capture-stdout"
+    ) {
+      this.renderingNative = false
+      return
+    }
+
     if (this._splitHeight > 0 && this._externalOutputMode === "capture-stdout") {
       this.flushPendingSplitCommits(false)
     } else {
