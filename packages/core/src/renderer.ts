@@ -1406,6 +1406,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     }
 
     const commits: ExternalOutputCommit[] = []
+    const chunkWidth = Math.max(1, this.width)
     for (const row of this.splitStdoutRows(text)) {
       const rowCells = [...row.line]
       if (rowCells.length === 0) {
@@ -1415,8 +1416,8 @@ export class CliRenderer extends EventEmitter implements RenderContext {
 
       let offset = 0
       while (offset < rowCells.length) {
-        const chunk = rowCells.slice(offset, offset + this.width).join("")
-        offset += this.width
+        const chunk = rowCells.slice(offset, offset + chunkWidth).join("")
+        offset += chunkWidth
         const isLastChunk = offset >= rowCells.length
         commits.push(this.createStdoutSnapshotCommit(chunk, isLastChunk ? row.trailingNewline : false))
       }
@@ -1436,7 +1437,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
 
     for (const commit of commits) {
       try {
-        this.renderOffset = this.lib.renderSplitFooterSnapshot(
+        this.renderOffset = this.lib.commitSplitFooterSnapshot(
           this.rendererPtr,
           commit.snapshot,
           commit.rowColumns,
